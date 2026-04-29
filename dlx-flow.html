@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RabbitMQ 完整死信處理流程展示</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            height: 500px; /* 固定高度讓下方有空間放 Log */
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        /* 自訂捲軸樣式給 Log 區塊 */
+        .log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .log-container::-webkit-scrollbar-track {
+            background: #f1f5f9; 
+        }
+        .log-container::-webkit-scrollbar-thumb {
+            background: #cbd5e1; 
+            border-radius: 4px;
+        }
+        .log-container::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8; 
+        }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen p-4 md:p-6 flex flex-col gap-4">
+
+    <!-- 上半部：控制面板與 Canvas -->
+    <div class="max-w-7xl w-full mx-auto bg-white rounded-2xl shadow-xl overflow-hidden flex flex-col xl:flex-row border border-slate-200 flex-grow">
+        
+        <!-- 左側控制面板 -->
+        <div class="w-full xl:w-80 bg-slate-100 p-5 flex flex-col gap-5 border-r border-slate-200 shadow-inner z-10 shrink-0 overflow-y-auto">
+            <div>
+                <h1 class="text-xl font-bold text-slate-800 mb-1">RabbitMQ 流程展示</h1>
+                <p class="text-xs text-slate-500 mb-2">死信產生與後續處理機制</p>
+            </div>
+
+            <!-- 操作區 -->
+            <div class="flex flex-col gap-3 text-sm">
+                <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                    <h2 class="font-semibold text-slate-700 mb-2">1. 訊息生產者</h2>
+                    <div class="flex gap-2">
+                        <button id="btn-send" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-medium py-1.5 px-3 rounded transition-colors text-xs">
+                            單筆發送
+                        </button>
+                        <button id="btn-auto" class="flex-1 bg-slate-600 hover:bg-slate-700 text-white font-medium py-1.5 px-3 rounded transition-colors text-xs">
+                            自動發送
+                        </button>
+                    </div>
+                </div>
+
+                <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2">
+                    <h2 class="font-semibold text-slate-700">2. 主佇列設定 (觸發 DLX)</h2>
+                    
+                    <div>
+                        <label class="block text-xs text-slate-600 mb-1 flex justify-between">
+                            <span>TTL 存活時間 (毫秒)</span>
+                            <span id="ttl-val" class="font-mono text-blue-600">3000</span>
+                        </label>
+                        <input type="range" id="ttl-slider" min="1000" max="10000" step="500" value="3000" class="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer">
+                    </div>
+
+                    <div>
+                        <label class="block text-xs text-slate-600 mb-1 flex justify-between">
+                            <span>最大長度限制 (筆)</span>
+                            <span id="maxlen-val" class="font-mono text-blue-600">5</span>
+                        </label>
+                        <input type="range" id="maxlen-slider" min="1" max="10" step="1" value="5" class="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer">
+                    </div>
+                </div>
+
+                <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+                    <h2 class="font-semibold text-slate-700 mb-2">3. 主消費者狀態</h2>
+                    <select id="consumer-state" class="w-full border border-slate-300 rounded p-1.5 text-xs bg-slate-50 outline-none focus:border-blue-500">
+                        <option value="active">🟢 正常消費</option>
+                        <option value="offline">⚫ 停機 (累積訊息)</option>
+                        <option value="reject">🔴 拒絕 (觸發 DLX)</option>
+                    </select>
+                </div>
+
+                <div class="bg-red-50 p-3 rounded-xl border border-red-100 shadow-sm">
+                    <h2 class="font-semibold text-red-800 mb-2">4. 死信處理端 (DLX Consumer)</h2>
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs text-slate-700">處理模式：</span>
+                        <select id="dlx-action" class="border border-red-200 rounded p-1 text-xs bg-white text-red-700 outline-none">
+                            <option value="log">📝 記錄後捨棄</option>
+                            <option value="requeue">🔄 修正後重送</option>
+                            <option value="pause">⏸️ 暫停處理 (堆積)</option>
+                        </select>
+                    </div>
+                    <button id="btn-process-dlq" class="w-full bg-red-600 hover:bg-red-700 text-white font-medium py-1.5 px-3 rounded transition-colors text-xs">
+                        手動處理一筆死信
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右側 Canvas 區 -->
+        <div class="flex-grow bg-white relative flex flex-col">
+            <!-- 圖例 -->
+            <div class="absolute top-2 right-2 bg-white/90 backdrop-blur p-2 rounded shadow border border-slate-100 text-[10px] flex gap-3 z-10 pointer-events-none">
+                <div class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span>正常</div>
+                <div class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-orange-500"></span>TTL過期</div>
+                <div class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-red-500"></span>滿載溢出</div>
+                <div class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-purple-500"></span>被拒絕</div>
+                <div class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-blue-400"></span>重送中</div>
+            </div>
+            
+            <div class="canvas-container flex-grow" id="canvas-wrapper">
+                <canvas id="rmq-canvas"></canvas>
+                <!-- 浮動提示框 (Tooltip) -->
+                <div id="tooltip" class="absolute hidden bg-gray-800 text-white text-xs px-2 py-1 rounded pointer-events-none z-20 whitespace-nowrap shadow-lg"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 下半部：即時事件紀錄 Log -->
+    <div class="max-w-7xl w-full mx-auto bg-slate-900 rounded-xl shadow-lg overflow-hidden flex flex-col h-64 border border-slate-800">
+        <div class="bg-slate-800 p-2 border-b border-slate-700 flex justify-between items-center shrink-0">
+            <h3 class="text-slate-200 text-sm font-mono flex items-center gap-2">
+                <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span> 系統事件紀錄 (Event Log)
+            </h3>
+            <button id="btn-clear-log" class="text-xs text-slate-400 hover:text-white px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 transition">清除紀錄</button>
+        </div>
+        <div id="log-container" class="log-container p-3 overflow-y-auto flex-grow font-mono text-xs text-slate-300 flex flex-col gap-1">
+            <!-- Logs will be appended here -->
+        </div>
+    </div>
+
+<script>
+    // --- 系統設定 ---
+    const config = {
+        ttl: 3000,
+        maxLength: 5,
+        consumerState: 'active', // 'active', 'offline', 'reject'
+        consumerSpeed: 1500,     
+        messageSpeed: 0.04,      // 稍微放慢讓流程更清楚
+        autoSend: false,
+        dlxAction: 'log',        // 'log', 'requeue', 'pause'
+        dlxProcessSpeed: 2000
+    };
+
+    // --- DOM 元件綁定 ---
+    const wrapper = document.getElementById('canvas-wrapper');
+    const canvas = document.getElementById('rmq-canvas');
+    const ctx = canvas.getContext('2d');
+    
+    // UI Controls
+    const btnSend = document.getElementById('btn-send');
+    const btnAuto = document.getElementById('btn-auto');
+    const ttlSlider = document.getElementById('ttl-slider');
+    const ttlVal = document.getElementById('ttl-val');
+    const maxlenSlider = document.getElementById('maxlen-slider');
+    const maxlenVal = document.getElementById('maxlen-val');
+    const consumerStateSelect = document.getElementById('consumer-state');
+    
+    // DLX UI
+    const dlxActionSelect = document.getElementById('dlx-action');
+    const btnProcessDlq = document.getElementById('btn-process-dlq');
+    
+    // Log UI
+    const logContainer = document.getElementById('log-container');
+    const btnClearLog = document.getElementById('btn-clear-log');
+    const tooltip = document.getElementById('tooltip');
+
+    // --- Canvas 響應式調整 ---
+    let width, height;
+    function resizeCanvas() {
+        // 設定實際像素大小以保持清晰度
+        const rect = wrapper.getBoundingClientRect();
+        canvas.width = rect.width * window.devicePixelRatio;
+        canvas.height = rect.height * window.devicePixelRatio;
+        ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        width = rect.width;
+        height = rect.height;
+        updateNodesLayout();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // --- 節點架構定義 ---
+    const nodes = {
+        producer:    { x: 0, y: 0, type: 'actor', label: 'Producer', color: '#3b82f6', icon: '👤' },
+        mainEx:      { x: 0, y: 0, type: 'exchange', label: 'Main EX', color: '#0ea5e9' },
+        mainQ:       { x: 0, y: 0, type: 'queue', label: 'Main Queue', color: '#22c55e' },
+        consumer:    { x: 0, y: 0, type: 'actor', label: 'Main App', color: '#10b981', icon: '💻' },
+        dlx:         { x: 0, y: 0, type: 'exchange', label: 'DLX', color: '#ef4444' },
+        dlq:         { x: 0, y: 0, type: 'queue', label: 'DLQ', color: '#dc2626' },
+        dlxConsumer: { x: 0, y: 0, type: 'actor', label: 'DLX Handler', color: '#b91c1c', icon: '🛠️' }
+    };
+
+    function updateNodesLayout() {
+        const cx = width / 2;
+        const cyTop = 100;
+        const cyBottom = 320;
+        
+        // 上半部：正常流程
+        nodes.producer.x = cx - 350; nodes.producer.y = cyTop;
+        nodes.mainEx.x = cx - 180;   nodes.mainEx.y = cyTop;
+        nodes.mainQ.x = cx + 50;     nodes.mainQ.y = cyTop;
+        nodes.consumer.x = cx + 300; nodes.consumer.y = cyTop;
+        
+        // 下半部：死信流程
+        nodes.dlx.x = cx - 180;       nodes.dlx.y = cyBottom; // 對齊 MainEX
+        nodes.dlq.x = cx + 50;        nodes.dlq.y = cyBottom; // 對齊 MainQ
+        nodes.dlxConsumer.x = cx + 300; nodes.dlxConsumer.y = cyBottom; // 對齊 Main Consumer
+    }
+
+    // --- 模擬狀態與資料結構 ---
+    let messages = [];
+    let mainQueueArr = [];
+    let dlQueueArr = [];
+    let lastConsumeTime = 0;
+    let lastDlxProcessTime = 0;
+    let autoSendInterval = null;
+    let msgCounter = 1;
+
+    // --- Logger 系統 ---
+    function addLog(msgId, action, detail, type = 'info') {
+        const time = new Date().toLocaleTimeString('zh-TW', { hour12: false, fractionalSecondDigits: 2 });
+        const el = document.createElement('div');
+        
+        let colorClass = 'text-slate-300';
+        if(type === 'error') colorClass = 'text-red-400';
+        if(type === 'warn') colorClass = 'text-orange-400';
+        if(type === 'success') colorClass = 'text-green-400';
+        if(type === 'requeue') colorClass = 'text-blue-400';
+
+        el.className = `flex gap-3 hover:bg-slate-800 p-1 rounded transition ${colorClass}`;
+        el.innerHTML = `
+            <span class="text-slate-500 shrink-0">[${time}]</span>
+            <span class="font-bold shrink-0 w-16">MSG-${msgId}</span>
+            <span class="font-semibold shrink-0 w-24">[${action}]</span>
+            <span class="truncate">${detail}</span>
+        `;
+        logContainer.appendChild(el);
+        // 自動捲動到底部
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+
+    // --- 訊息類別 ---
+    class Message {
+        constructor(isRetry = false) {
+            this.id = String(msgCounter++).padStart(3, '0');
+            this.isRetry = isRetry;
+            
+            if (isRetry) {
+                // 如果是重送的訊息，從 DLX Handler 出發
+                this.x = nodes.dlxConsumer.x;
+                this.y = nodes.dlxConsumer.y - 30;
+                this.stage = 'requeue_to_main_ex';
+                this.targetX = nodes.mainEx.x;
+                this.targetY = nodes.mainEx.y - 50; // 繞上面回去
+                this.color = '#60a5fa'; // Blue for retry
+                addLog(this.id, 'REQUEUE', '死信處理常式修正訊息，重新發送至主交換機', 'requeue');
+            } else {
+                // 正常發送
+                this.x = nodes.producer.x;
+                this.y = nodes.producer.y;
+                this.stage = 'to_main_ex'; 
+                this.targetX = nodes.mainEx.x;
+                this.targetY = nodes.mainEx.y;
+                this.color = '#22c55e'; // Green
+                addLog(this.id, 'PUBLISH', '生產者發送新訊息');
+            }
+            
+            this.createdAt = Date.now();
+            this.queueEntryTime = 0;
+            this.deadReason = null;
+            this.opacity = 1;
+            
+            // 讓訊息繪製時稍微偏離中心，避免重疊
+            this.offsetY = (Math.random() - 0.5) * 10;
+        }
+
+        update() {
+            // 平滑移動
+            const dx = this.targetX - this.x;
+            const dy = (this.targetY + this.offsetY) - this.y;
+            this.x += dx * config.messageSpeed;
+            this.y += dy * config.messageSpeed;
+
+            const dist = Math.sqrt(dx*dx + dy*dy);
+
+            if (dist < 5) {
+                this.handleStageTransition();
+            }
+
+            // 檢查 TTL (只在主佇列中檢查)
+            if (this.stage === 'in_main_q') {
+                const age = Date.now() - this.queueEntryTime;
+                if (age >= config.ttl) {
+                    this.makeDeadLetter('ttl');
+                }
+            }
+        }
+
+        handleStageTransition() {
+            switch (this.stage) {
+                case 'requeue_to_main_ex':
+                case 'to_main_ex':
+                    this.stage = 'to_main_q';
+                    this.targetX = nodes.mainQ.x - 70; // 佇列入口
+                    this.targetY = nodes.mainQ.y;
+                    if(this.stage === 'to_main_q' && !this.isRetry) addLog(this.id, 'ROUTING', '主交換機路由至主佇列');
+                    break;
+                    
+                case 'to_main_q':
+                    if (mainQueueArr.length >= config.maxLength) {
+                        const oldestMsg = mainQueueArr.shift();
+                        if(oldestMsg) oldestMsg.makeDeadLetter('maxlen');
+                    }
+                    this.stage = 'in_main_q';
+                    this.queueEntryTime = Date.now();
+                    mainQueueArr.push(this);
+                    addLog(this.id, 'ENQUEUE', `進入主佇列等待消費 (當前長度: ${mainQueueArr.length})`);
+                    break;
+                    
+                case 'to_consumer':
+                    this.stage = 'consumed';
+                    addLog(this.id, 'CONSUMED', '主應用程式成功處理訊息', 'success');
+                    break;
+                    
+                case 'to_dlx':
+                    this.stage = 'to_dlq';
+                    this.targetX = nodes.dlq.x - 70;
+                    this.targetY = nodes.dlq.y;
+                    addLog(this.id, 'DLX_ROUTE', '死信交換機路由至死信佇列 (DLQ)', 'warn');
+                    break;
+                    
+                case 'to_dlq':
+                    this.stage = 'in_dlq';
+                    dlQueueArr.push(this);
+                    addLog(this.id, 'DLQ_ENQUEUE', `進入死信佇列等待人工/排程處理 (DLQ長度: ${dlQueueArr.length})`, 'error');
+                    break;
+                    
+                case 'to_dlx_consumer':
+                    this.stage = 'dlx_processed';
+                    break;
+                    
+                case 'consumed':
+                case 'dlx_processed':
+                    this.opacity -= 0.05;
+                    if(this.opacity < 0) this.opacity = 0;
+                    break;
+            }
+        }
+
+        makeDeadLetter(reason) {
+            this.stage = 'to_dlx';
+            this.deadReason = reason;
+            this.targetX = nodes.dlx.x;
+            this.targetY = nodes.dlx.y;
+            
+            let reasonText = "";
+            if(reason === 'ttl') {
+                this.color = '#f97316'; // Orange
+                reasonText = `TTL 過期 (${config.ttl}ms)`;
+                addLog(this.id, 'DEAD_LETTER', reasonText, 'warn');
+            } else if(reason === 'maxlen') {
+                this.color = '#ef4444'; // Red
+                reasonText = "主佇列滿載，舊訊息被擠出";
+                addLog(this.id, 'DEAD_LETTER', reasonText, 'error');
+            } else if(reason === 'reject') {
+                this.color = '#a855f7'; // Purple
+                reasonText = "消費者拒絕 (basic.reject, requeue=false)";
+                addLog(this.id, 'DEAD_LETTER', reasonText, 'error');
+            }
+
+            const idx = mainQueueArr.indexOf(this);
+            if (idx > -1) mainQueueArr.splice(idx, 1);
+        }
+
+        draw(ctx) {
+            ctx.save();
+            ctx.globalAlpha = this.opacity;
+            
+            // 畫訊息圓點
+            ctx.beginPath();
+            ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+            ctx.fillStyle = this.color;
+            ctx.fill();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#fff';
+            ctx.stroke();
+            
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = this.color;
+            ctx.fill();
+            
+            // 畫 ID
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 8px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(this.id, this.x, this.y);
+            
+            ctx.restore();
+        }
+        
+        // 用於 Hover 判斷
+        isPointInside(x, y) {
+            const dx = this.x - x;
+            const dy = this.y - y;
+            return Math.sqrt(dx*dx + dy*dy) <= 12; // 感應範圍稍微大一點
+        }
+    }
+
+    // --- 繪圖輔助函數 ---
+    function drawConnection(x1, y1, x2, y2, type = 'normal') {
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        
+        if (type === 'dlx') {
+            // 從主佇列掉落到 DLX
+            ctx.lineTo(x1, y2); 
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = '#fca5a5';
+            ctx.setLineDash([5, 5]);
+        } else if (type === 'requeue') {
+            // 從 DLX Handler 繞回 Main EX
+            ctx.bezierCurveTo(x1, y1 - 150, x2, y2 - 150, x2, y2);
+            ctx.strokeStyle = '#93c5fd';
+            ctx.setLineDash([8, 4]);
+        } else {
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = '#cbd5e1';
+            ctx.setLineDash([]);
+        }
+        
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.setLineDash([]); // reset
+    }
+
+    function drawNode(node) {
+        ctx.save();
+        ctx.translate(node.x, node.y);
+
+        if (node.type === 'actor') {
+            ctx.fillStyle = '#fff';
+            ctx.strokeStyle = node.color;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.roundRect(-45, -30, 90, 60, 8);
+            ctx.fill();
+            ctx.stroke();
+            
+            ctx.fillStyle = '#334155';
+            ctx.font = '12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(node.label, 0, 20);
+            ctx.font = '24px sans-serif';
+            ctx.fillText(node.icon, 0, -2);
+            
+            // 狀態指示燈
+            if(node.label === 'Main App') {
+                ctx.beginPath();
+                ctx.arc(35, -20, 5, 0, Math.PI*2);
+                ctx.fillStyle = config.consumerState === 'active' ? '#10b981' : (config.consumerState === 'reject' ? '#ef4444' : '#64748b');
+                ctx.fill();
+            } else if (node.label === 'DLX Handler') {
+                ctx.beginPath();
+                ctx.arc(35, -20, 5, 0, Math.PI*2);
+                ctx.fillStyle = config.dlxAction === 'pause' ? '#64748b' : '#ef4444';
+                ctx.fill();
+            }
+
+        } else if (node.type === 'exchange') {
+            ctx.fillStyle = '#fff';
+            ctx.strokeStyle = node.color;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(0, 0, 30, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = node.color;
+            ctx.font = 'bold 28px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('X', 0, 0);
+
+            ctx.fillStyle = '#475569';
+            ctx.font = '12px sans-serif';
+            ctx.fillText(node.label, 0, 45);
+
+        } else if (node.type === 'queue') {
+            ctx.fillStyle = '#f8fafc';
+            ctx.strokeStyle = node.color;
+            ctx.lineWidth = 3;
+            
+            // 畫 Queue 外框
+            ctx.beginPath();
+            ctx.moveTo(-70, -25);
+            ctx.lineTo(70, -25);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(-70, 25);
+            ctx.lineTo(70, 25);
+            ctx.stroke();
+
+            ctx.fillStyle = '#475569';
+            ctx.font = 'bold 12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(node.label, 0, -35);
+
+            // 容量文字
+            if (node.label === 'Main Queue') {
+                ctx.font = '11px sans-serif';
+                ctx.fillStyle = mainQueueArr.length >= config.maxLength ? '#ef4444' : '#64748b';
+                ctx.fillText(`(${mainQueueArr.length}/${config.maxLength})`, 0, 42);
+            } else {
+                ctx.font = '11px sans-serif';
+                ctx.fillStyle = dlQueueArr.length > 0 ? '#dc2626' : '#64748b';
+                ctx.fillText(`(Total: ${dlQueueArr.length})`, 0, 42);
+            }
+        }
+
+        ctx.restore();
+    }
+
+    // --- 滑鼠互動 (Tooltip) ---
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        // 考慮 devicePixelRatio 與 CSS 縮放
+        const scaleX = canvas.width / rect.width / window.devicePixelRatio;
+        const scaleY = canvas.height / rect.height / window.devicePixelRatio;
+        
+        const mouseX = (e.clientX - rect.left) * scaleX;
+        const mouseY = (e.clientY - rect.top) * scaleY;
+
+        let hoveredMsg = null;
+        for (let msg of messages) {
+            if (msg.isPointInside(mouseX, mouseY) && msg.opacity > 0.5) {
+                hoveredMsg = msg;
+                break;
+            }
+        }
+
+        if (hoveredMsg) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 10) + 'px';
+            tooltip.style.top = (e.clientY + 10) + 'px';
+            
+            let statusStr = hoveredMsg.stage;
+            if(hoveredMsg.stage === 'in_main_q') {
+                const age = Math.round((Date.now() - hoveredMsg.queueEntryTime)/1000);
+                statusStr = `等待中 (已過 ${age}s / TTL: ${config.ttl/1000}s)`;
+            } else if (hoveredMsg.deadReason) {
+                statusStr = `死信原因: ${hoveredMsg.deadReason}`;
+            }
+
+            tooltip.innerHTML = `
+                <div><strong>MSG-${hoveredMsg.id}</strong></div>
+                <div>狀態: ${statusStr}</div>
+            `;
+            canvas.style.cursor = 'pointer';
+        } else {
+            tooltip.style.display = 'none';
+            canvas.style.cursor = 'default';
+        }
+    });
+
+    canvas.addEventListener('mouseout', () => {
+        tooltip.style.display = 'none';
+    });
+
+
+    // --- 主迴圈 ---
+    function animate() {
+        ctx.clearRect(0, 0, width, height);
+
+        // 1. 畫連接線
+        // 主流程
+        drawConnection(nodes.producer.x + 45, nodes.producer.y, nodes.mainEx.x - 30, nodes.mainEx.y);
+        drawConnection(nodes.mainEx.x + 30, nodes.mainEx.y, nodes.mainQ.x - 70, nodes.mainQ.y);
+        drawConnection(nodes.mainQ.x + 70, nodes.mainQ.y, nodes.consumer.x - 45, nodes.consumer.y);
+        
+        // 死信路由 (MainQ -> DLX)
+        drawConnection(nodes.mainQ.x, nodes.mainQ.y + 25, nodes.dlx.x, nodes.dlx.y - 30, 'dlx');
+        // 死信佇列與消費者 (DLX -> DLQ -> Handler)
+        drawConnection(nodes.dlx.x + 30, nodes.dlx.y, nodes.dlq.x - 70, nodes.dlq.y);
+        drawConnection(nodes.dlq.x + 70, nodes.dlq.y, nodes.dlxConsumer.x - 45, nodes.dlxConsumer.y);
+        
+        // 重送路線 (Handler -> MainEX)
+        if (config.dlxAction === 'requeue') {
+            drawConnection(nodes.dlxConsumer.x, nodes.dlxConsumer.y - 30, nodes.mainEx.x, nodes.mainEx.y - 30, 'requeue');
+        }
+
+        // 2. 畫節點
+        Object.values(nodes).forEach(node => drawNode(node));
+
+        // 3. 計算佇列內位置
+        mainQueueArr.forEach((msg, i) => {
+            msg.targetX = nodes.mainQ.x + 50 - (i * 18);
+            msg.targetY = nodes.mainQ.y;
+        });
+        
+        dlQueueArr.forEach((msg, i) => {
+            msg.targetX = nodes.dlq.x + 50 - ((i % 8) * 16); 
+            msg.targetY = nodes.dlq.y + Math.floor(i / 8) * -8; // 滿了往上疊
+        });
+
+        const now = Date.now();
+
+        // 4. 主消費者邏輯
+        if (config.consumerState !== 'offline' && now - lastConsumeTime > config.consumerSpeed) {
+            if (mainQueueArr.length > 0) {
+                const msgToConsume = mainQueueArr.shift();
+                
+                if (config.consumerState === 'active') {
+                    msgToConsume.stage = 'to_consumer';
+                    msgToConsume.targetX = nodes.consumer.x;
+                    msgToConsume.targetY = nodes.consumer.y;
+                } else if (config.consumerState === 'reject') {
+                    msgToConsume.makeDeadLetter('reject');
+                }
+                lastConsumeTime = now;
+            }
+        }
+
+        // 5. DLX 消費者邏輯 (自動處理 DLQ)
+        if (config.dlxAction !== 'pause' && now - lastDlxProcessTime > config.dlxProcessSpeed) {
+            if (dlQueueArr.length > 0) {
+                const dlMsg = dlQueueArr.shift();
+                dlMsg.stage = 'to_dlx_consumer';
+                dlMsg.targetX = nodes.dlxConsumer.x;
+                dlMsg.targetY = nodes.dlxConsumer.y;
+                
+                if (config.dlxAction === 'log') {
+                    addLog(dlMsg.id, 'DLX_CONSUME', '處理常式記錄死信內容，隨後將其捨棄', 'info');
+                } else if (config.dlxAction === 'requeue') {
+                    // 產生一個新的訊息代替重送
+                    setTimeout(() => {
+                        const retryMsg = new Message(true);
+                        retryMsg.id = dlMsg.id + '-R'; // 標示為重送
+                        messages.push(retryMsg);
+                    }, 500); // 動畫稍微延遲感
+                }
+                
+                lastDlxProcessTime = now;
+            }
+        }
+
+        // 6. 更新並繪製訊息
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            msg.update();
+            msg.draw(ctx);
+            
+            if ((msg.stage === 'consumed' || msg.stage === 'dlx_processed') && msg.opacity <= 0) {
+                messages.splice(i, 1);
+            }
+        }
+
+        requestAnimationFrame(animate);
+    }
+
+    // --- 事件監聽 ---
+    function spawnMessage() {
+        messages.push(new Message());
+    }
+
+    btnSend.addEventListener('click', spawnMessage);
+
+    btnAuto.addEventListener('click', () => {
+        config.autoSend = !config.autoSend;
+        if (config.autoSend) {
+            btnAuto.classList.replace('bg-slate-600', 'bg-blue-600');
+            btnAuto.textContent = '停止發送';
+            addLog('SYS', 'CONFIG', '啟動生產者自動發送');
+            autoSendInterval = setInterval(spawnMessage, 1000);
+        } else {
+            btnAuto.classList.replace('bg-blue-600', 'bg-slate-600');
+            btnAuto.textContent = '自動發送';
+            addLog('SYS', 'CONFIG', '停止生產者自動發送');
+            clearInterval(autoSendInterval);
+        }
+    });
+
+    ttlSlider.addEventListener('input', (e) => {
+        config.ttl = parseInt(e.target.value);
+        ttlVal.textContent = config.ttl;
+    });
+    ttlSlider.addEventListener('change', () => addLog('SYS', 'CONFIG', `修改主佇列 TTL 為 ${config.ttl}ms`));
+
+    maxlenSlider.addEventListener('input', (e) => {
+        config.maxLength = parseInt(e.target.value);
+        maxlenVal.textContent = config.maxLength;
+        while(mainQueueArr.length > config.maxLength) {
+            const msg = mainQueueArr.shift();
+            if(msg) msg.makeDeadLetter('maxlen');
+        }
+    });
+    maxlenSlider.addEventListener('change', () => addLog('SYS', 'CONFIG', `修改主佇列最大長度為 ${config.maxLength}`));
+
+    consumerStateSelect.addEventListener('change', (e) => {
+        config.consumerState = e.target.value;
+        const stateName = e.target.options[e.target.selectedIndex].text;
+        addLog('SYS', 'CONFIG', `主應用程式狀態變更為: ${stateName}`);
+    });
+
+    dlxActionSelect.addEventListener('change', (e) => {
+        config.dlxAction = e.target.value;
+        const actionName = e.target.options[e.target.selectedIndex].text;
+        addLog('SYS', 'CONFIG', `死信處理模式變更為: ${actionName}`);
+    });
+
+    btnProcessDlq.addEventListener('click', () => {
+        if (dlQueueArr.length > 0) {
+            // 強制觸發一次處理
+            lastDlxProcessTime = 0; 
+            // 暫時確保不會被 pause 阻擋單次執行
+            const currentAction = config.dlxAction;
+            if(currentAction === 'pause') {
+                config.dlxAction = 'log'; // 單次手動預設為 log
+                setTimeout(()=> { config.dlxAction = 'pause'; }, 100);
+            }
+        } else {
+            addLog('SYS', 'INFO', '目前死信佇列為空');
+        }
+    });
+
+    btnClearLog.addEventListener('click', () => {
+        logContainer.innerHTML = '';
+        addLog('SYS', 'INFO', '日誌已清空');
+    });
+
+    // --- 啟動初始化 ---
+    resizeCanvas();
+    addLog('SYS', 'INIT', 'RabbitMQ 死信視覺化系統啟動完成', 'success');
+    animate();
+
+</script>
+</body>
+</html>

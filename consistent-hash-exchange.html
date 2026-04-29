@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RabbitMQ 雜湊路由 (User Affinity)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f1f5f9; }
+        .canvas-container { position: relative; width: 100%; height: 380px; background: #ffffff; border-radius: 0.5rem; border: 1px solid #e2e8f0; }
+        canvas { display: block; width: 100%; height: 100%; border-radius: 0.5rem; }
+        
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f8fafc; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    </style>
+</head>
+<body class="p-4 flex flex-col gap-4 min-h-screen">
+
+    <header class="max-w-7xl mx-auto w-full bg-white rounded-xl shadow-sm border border-slate-200 p-5 shrink-0">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4 border-b border-slate-100 pb-4">
+            <div>
+                <h1 class="text-2xl font-black text-slate-800 flex items-center gap-2">
+                    <i class="fas fa-route text-blue-500"></i> Consistent Hashing (User Affinity)
+                </h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    使用 <code class="bg-slate-100 px-1 rounded text-pink-600">rabbitmq-consistent-hash-exchange</code> 外掛，將相同 User 的訊息固定路由到同一個 Queue，從物理上避免多 Consumer 競爭導致的亂序問題。
+                </p>
+            </div>
+            <button onclick="location.reload()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm transition shrink-0">
+                <i class="fas fa-undo"></i> 重置
+            </button>
+        </div>
+        
+        <div class="flex flex-wrap gap-4 items-center">
+            <div class="text-sm font-bold text-slate-600">模擬發送事件：</div>
+            <button onclick="fireEvent('Alice')" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded shadow font-bold transition flex items-center gap-2">
+                <i class="fas fa-user"></i> User: Alice
+            </button>
+            <button onclick="fireEvent('Bob')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded shadow font-bold transition flex items-center gap-2">
+                <i class="fas fa-user"></i> User: Bob
+            </button>
+            <button onclick="fireEvent('Charlie')" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded shadow font-bold transition flex items-center gap-2">
+                <i class="fas fa-user"></i> User: Charlie
+            </button>
+             <button id="btn-auto" class="ml-auto bg-slate-600 hover:bg-slate-700 text-white px-4 py-2 rounded shadow font-bold transition flex items-center gap-2">
+                <i class="fas fa-random"></i> 隨機自動發送
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-2 gap-6 flex-grow">
+        
+        <!-- 左側：Canvas 視覺化 -->
+        <section class="flex flex-col bg-white rounded-xl shadow border-t-4 border-t-blue-500 overflow-hidden lg:col-span-2 xl:col-span-1">
+            <div class="p-3 bg-blue-50 border-b border-blue-100 flex justify-between items-center shrink-0">
+                <h2 class="font-bold text-blue-800 flex items-center gap-2">
+                    <i class="fas fa-project-diagram"></i> 路由與分發視覺化
+                </h2>
+                 <span class="bg-blue-200 text-blue-800 text-[10px] px-2 py-0.5 rounded font-bold">Hash(Routing Key)</span>
+            </div>
+            <div class="canvas-container" id="hash-wrapper">
+                <canvas id="hash-canvas"></canvas>
+            </div>
+             <div class="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-600">
+                <i class="fas fa-info-circle text-blue-500"></i> <b>原理：</b> Exchange 會對 Routing Key (這裡使用 UserID) 取 Hash，映射到環上的點，然後路由到對應的 Queue。確保相同 User 永遠進同一個 Queue。
+            </div>
+        </section>
+
+        <!-- 右側：Consumer 狀態與 Log -->
+        <section class="flex flex-col gap-4 lg:col-span-2 xl:col-span-1">
+            
+            <!-- Queue 狀態面板 -->
+            <div class="bg-white rounded-xl shadow border border-slate-200 overflow-hidden grid grid-cols-3 divide-x divide-slate-200">
+                
+                <!-- Partition 1 -->
+                <div class="p-4 flex flex-col items-center justify-center relative overflow-hidden">
+                    <div class="absolute top-0 w-full h-1 bg-purple-400"></div>
+                    <div class="text-xs font-bold text-slate-500 mb-1">Queue (P1)</div>
+                    <i class="fas fa-layer-group text-slate-300 text-2xl mb-2"></i>
+                    <div class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded mb-2">綁定權重: 1</div>
+                    <div class="text-xs font-bold text-slate-700">Consumer 1</div>
+                    <div id="c1-users" class="mt-2 flex flex-wrap justify-center gap-1 min-h-[20px]"></div>
+                </div>
+
+                <!-- Partition 2 -->
+                <div class="p-4 flex flex-col items-center justify-center relative overflow-hidden">
+                    <div class="absolute top-0 w-full h-1 bg-blue-400"></div>
+                    <div class="text-xs font-bold text-slate-500 mb-1">Queue (P2)</div>
+                    <i class="fas fa-layer-group text-slate-300 text-2xl mb-2"></i>
+                     <div class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded mb-2">綁定權重: 1</div>
+                    <div class="text-xs font-bold text-slate-700">Consumer 2</div>
+                    <div id="c2-users" class="mt-2 flex flex-wrap justify-center gap-1 min-h-[20px]"></div>
+                </div>
+
+                <!-- Partition 3 -->
+                <div class="p-4 flex flex-col items-center justify-center relative overflow-hidden">
+                    <div class="absolute top-0 w-full h-1 bg-green-400"></div>
+                    <div class="text-xs font-bold text-slate-500 mb-1">Queue (P3)</div>
+                    <i class="fas fa-layer-group text-slate-300 text-2xl mb-2"></i>
+                     <div class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded mb-2">綁定權重: 1</div>
+                    <div class="text-xs font-bold text-slate-700">Consumer 3</div>
+                    <div id="c3-users" class="mt-2 flex flex-wrap justify-center gap-1 min-h-[20px]"></div>
+                </div>
+            </div>
+
+            <!-- 綜合 Log 區 -->
+            <div class="flex-grow bg-slate-900 rounded-xl shadow overflow-hidden flex flex-col border border-slate-800">
+                <div class="p-2 border-b border-slate-700 bg-slate-800 flex justify-between items-center">
+                    <div class="text-slate-300 text-xs font-mono font-bold flex items-center gap-2">
+                        <i class="fas fa-terminal"></i> 系統路由與處理日誌
+                    </div>
+                </div>
+                <div id="sys-log" class="custom-scrollbar overflow-y-auto flex-grow font-mono text-[10px] flex flex-col gap-1 p-2"></div>
+            </div>
+            
+        </section>
+
+    </main>
+
+<script>
+    // --- 使用者定義與 Hash 模擬 ---
+    const USERS = {
+        'Alice': { color: '#a855f7', prefix: 'A' }, // Purple
+        'Bob': { color: '#3b82f6', prefix: 'B' },   // Blue
+        'Charlie': { color: '#10b981', prefix: 'C' } // Green
+    };
+
+    // 模擬 Consistent Hashing 分配 (寫死的簡化版，確保固定結果)
+    const HASH_MAP = {
+        'Alice': 0,   // 對應 Queue 1
+        'Bob': 1,     // 對應 Queue 2
+        'Charlie': 2  // 對應 Queue 3
+    };
+
+    let eventCounter = 1;
+    let autoInterval = null;
+
+    // --- 狀態追蹤 ---
+    const queueUsers = { 0: new Set(), 1: new Set(), 2: new Set() };
+
+    function updateQueueUI() {
+        for (let i = 0; i < 3; i++) {
+            const container = document.getElementById(`c${i+1}-users`);
+            container.innerHTML = '';
+            queueUsers[i].forEach(userName => {
+                const u = USERS[userName];
+                container.innerHTML += `<span class="text-[9px] text-white px-1.5 py-0.5 rounded shadow-sm" style="background-color: ${u.color}">${userName}</span>`;
+            });
+        }
+    }
+
+    function addLog(userId, action, msg) {
+        const container = document.getElementById('sys-log');
+        const colorStr = USERS[userId] ? `style="color: ${USERS[userId].color}"` : 'class="text-slate-400"';
+        const el = document.createElement('div');
+        el.className = `flex gap-2 rounded px-1 py-0.5 hover:bg-slate-800 transition`;
+        el.innerHTML = `
+            <span class="text-slate-500 shrink-0">[${new Date().toISOString().substring(17,23)}]</span>
+            <span class="shrink-0 w-16 font-bold text-right" ${colorStr}>[${userId}]</span>
+            <span class="shrink-0 w-16 font-semibold text-slate-300">[${action}]</span>
+            <span class="text-slate-300">${msg}</span>
+        `;
+        container.appendChild(el);
+        container.scrollTop = container.scrollHeight;
+    }
+
+    // --- Canvas 動畫引擎 ---
+    class HashEngine {
+        constructor(canvasId) {
+            this.canvas = document.getElementById(canvasId);
+            this.ctx = this.canvas.getContext('2d');
+            
+            this.width = 0;
+            this.height = 0;
+            
+            this.particles = [];
+            this.queues = []; // 3個 Queue 的視覺資訊
+            
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
+            
+            this.setupLayout();
+        }
+
+        resize() {
+            const rect = this.canvas.parentElement.getBoundingClientRect();
+            this.canvas.width = rect.width * window.devicePixelRatio;
+            this.canvas.height = rect.height * window.devicePixelRatio;
+            this.ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            this.width = rect.width;
+            this.height = rect.height;
+            this.setupLayout();
+        }
+
+        setupLayout() {
+            const cx = this.width / 2;
+            const qStartY = 100;
+            const qSpacing = 90;
+            
+            // Queue 1, 2, 3 位置 (固定在右側)
+            this.queues = [
+                { id: 'Q1', x: this.width - 120, y: qStartY, color: '#a855f7', items: [] },
+                { id: 'Q2', x: this.width - 120, y: qStartY + qSpacing, color: '#3b82f6', items: [] },
+                { id: 'Q3', x: this.width - 120, y: qStartY + qSpacing * 2, color: '#10b981', items: [] }
+            ];
+            
+            this.exX = cx - 40;
+            this.exY = this.height / 2;
+        }
+
+        publish(userName) {
+            const id = `E-${eventCounter++}`;
+            const user = USERS[userName];
+            const qIndex = HASH_MAP[userName]; // 模擬 Hash 計算得到目標 Queue
+            
+            addLog(userName, 'PUBLISH', `RoutingKey="${userName}", Message="${id}"`);
+            
+            this.particles.push({
+                id, userName, color: user.color, icon: user.prefix,
+                x: 30, y: this.height / 2, 
+                targetX: this.exX, targetY: this.exY, 
+                state: 'to_exchange', qIndex
+            });
+        }
+
+        update() {
+            // 移動粒子
+            for (let i = this.particles.length - 1; i >= 0; i--) {
+                const p = this.particles[i];
+                
+                p.x += (p.targetX - p.x) * 0.15;
+                p.y += (p.targetY - p.y) * 0.15;
+                
+                if (Math.hypot(p.targetX - p.x, p.targetY - p.y) < 2) {
+                    if (p.state === 'to_exchange') {
+                        // 到達 Exchange，計算 Hash 決定路徑
+                        p.state = 'routing';
+                        
+                        // 動畫暫停一下展示 Hash 過程
+                        p.hashTimer = 30; 
+                    } 
+                    else if (p.state === 'routing') {
+                        p.hashTimer--;
+                        if (p.hashTimer <= 0) {
+                            p.state = 'to_queue';
+                            const targetQ = this.queues[p.qIndex];
+                            p.targetX = targetQ.x - 30; // 飛到 Queue 入口
+                            p.targetY = targetQ.y;
+                            addLog(p.userName, 'HASH', `Hash("${p.userName}") 命中 Partition ${p.qIndex+1} -> 路由至 ${targetQ.id}`);
+                        }
+                    }
+                    else if (p.state === 'to_queue') {
+                        // 進入 Queue，準備消費
+                        const targetQ = this.queues[p.qIndex];
+                        targetQ.items.push(p); // 放入實體陣列
+                        
+                        // 更新狀態 UI
+                        queueUsers[p.qIndex].add(p.userName);
+                        updateQueueUI();
+                        
+                        this.particles.splice(i, 1); // 從飛行動畫中移除
+                        
+                        // 模擬 Consumer 處理
+                        this.processQueue(p.qIndex);
+                    }
+                }
+            }
+        }
+
+        processQueue(qIndex) {
+            const targetQ = this.queues[qIndex];
+            
+            // 簡單模擬：如果這 Queue 只有一筆，就立刻處理 (這就是嚴格保序的關鍵)
+            // 如果已經在處理中，就在 Queue 裡排隊
+            if (!targetQ.isProcessing && targetQ.items.length > 0) {
+                targetQ.isProcessing = true;
+                const msg = targetQ.items.shift();
+                
+                addLog(msg.userName, 'CONSUME', `Consumer ${qIndex+1} 開始處理 ${msg.id}`);
+                
+                setTimeout(() => {
+                    addLog(msg.userName, 'ACK', `Consumer ${qIndex+1} 完成處理，發送 ACK`);
+                    targetQ.isProcessing = false;
+                    
+                    // 繼續處理下一筆
+                    this.processQueue(qIndex);
+                }, 1000); // 模擬處理時間
+            }
+        }
+
+        draw() {
+            this.ctx.clearRect(0, 0, this.width, this.height);
+
+            // --- 畫 Exchange ---
+            this.ctx.fillStyle = '#fff'; this.ctx.strokeStyle = '#64748b'; this.ctx.lineWidth = 2;
+            this.ctx.beginPath(); this.ctx.arc(this.exX, this.exY, 40, 0, Math.PI*2); this.ctx.fill(); this.ctx.stroke();
+            this.ctx.fillStyle = '#1e293b'; this.ctx.font = 'bold 12px sans-serif'; this.ctx.textAlign = 'center';
+            this.ctx.fillText('Hash-Ex', this.exX, this.exY - 5);
+            this.ctx.fillStyle = '#64748b'; this.ctx.font = '10px sans-serif';
+            this.ctx.fillText('x-consistent-hash', this.exX, this.exY + 10);
+
+            // --- 畫 Producer 連線 ---
+            this.ctx.strokeStyle = '#cbd5e1'; this.ctx.lineWidth = 2;
+            this.ctx.beginPath(); this.ctx.moveTo(20, this.exY); this.ctx.lineTo(this.exX - 40, this.exY); this.ctx.stroke();
+
+            // --- 畫 Queues 與 路由線 ---
+            this.queues.forEach((q, idx) => {
+                // 路由線 (虛線)
+                this.ctx.strokeStyle = '#e2e8f0'; this.ctx.lineWidth = 1; this.ctx.setLineDash([4, 4]);
+                this.ctx.beginPath(); this.ctx.moveTo(this.exX + 40, this.exY); this.ctx.lineTo(q.x - 60, q.y); this.ctx.stroke();
+                this.ctx.setLineDash([]);
+                
+                // Queue 本體 (管狀)
+                this.ctx.strokeStyle = q.color; this.ctx.lineWidth = 2;
+                this.ctx.beginPath(); this.ctx.moveTo(q.x - 60, q.y - 15); this.ctx.lineTo(q.x + 30, q.y - 15); this.ctx.stroke();
+                this.ctx.beginPath(); this.ctx.moveTo(q.x - 60, q.y + 15); this.ctx.lineTo(q.x + 30, q.y + 15); this.ctx.stroke();
+                
+                // Label
+                this.ctx.fillStyle = '#475569'; this.ctx.font = 'bold 10px sans-serif'; this.ctx.textAlign = 'right';
+                this.ctx.fillText(q.id, q.x - 70, q.y + 3);
+
+                // Consumer 區塊
+                this.ctx.fillStyle = q.color + '20'; // 淡色背景
+                this.ctx.beginPath(); this.ctx.roundRect(q.x + 30, q.y - 20, 60, 40, 4); this.ctx.fill();
+                this.ctx.fillStyle = '#1e293b'; this.ctx.textAlign = 'center';
+                this.ctx.fillText(`C-${idx+1}`, q.x + 60, q.y + 4);
+
+                // 畫 Queue 內排隊的物件
+                q.items.forEach((item, i) => {
+                    const drawX = q.x + 15 - (i * 15); // 從右往左排
+                    if (drawX > q.x - 55) {
+                        this.ctx.fillStyle = item.color;
+                        this.ctx.beginPath(); this.ctx.arc(drawX, q.y, 6, 0, Math.PI*2); this.ctx.fill();
+                        this.ctx.fillStyle = '#fff'; this.ctx.font = '8px sans-serif'; this.ctx.fillText(item.icon, drawX, q.y+3);
+                    }
+                });
+
+                // 處理中的動畫特效 (齒輪概念)
+                if (q.isProcessing) {
+                    this.ctx.strokeStyle = q.color; this.ctx.lineWidth = 2;
+                    this.ctx.beginPath(); this.ctx.arc(q.x + 60, q.y, 14 + (Date.now() % 1000)/200, 0, Math.PI*2); this.ctx.stroke();
+                }
+            });
+
+            // --- 畫飛行動畫 ---
+            this.particles.forEach(p => {
+                this.ctx.fillStyle = p.color;
+                this.ctx.beginPath(); this.ctx.arc(p.x, p.y, 10, 0, Math.PI*2); this.ctx.fill();
+                
+                this.ctx.fillStyle = '#fff'; this.ctx.font = 'bold 10px sans-serif'; this.ctx.textAlign = 'center'; this.ctx.textBaseline = 'middle';
+                this.ctx.fillText(p.icon, p.x, p.y);
+                this.ctx.textBaseline = 'alphabetic'; // reset
+                
+                // Hash 狀態文字
+                if (p.state === 'routing') {
+                    this.ctx.fillStyle = '#475569'; this.ctx.font = 'bold 10px monospace';
+                    this.ctx.fillText(`Hash(${p.userName})`, p.x, p.y - 15);
+                }
+            });
+        }
+    }
+
+    const engine = new HashEngine('hash-canvas');
+
+    function animate() {
+        engine.update();
+        engine.draw();
+        requestAnimationFrame(animate);
+    }
+    animate();
+
+    // 觸發事件
+    function fireEvent(userName) {
+        engine.publish(userName);
+    }
+
+    // 自動模式
+    const btnAuto = document.getElementById('btn-auto');
+    btnAuto.addEventListener('click', () => {
+        if (autoInterval) {
+            clearInterval(autoInterval);
+            autoInterval = null;
+            btnAuto.innerHTML = '<i class="fas fa-random"></i> 隨機自動發送';
+            btnAuto.classList.replace('bg-slate-500', 'bg-slate-600');
+        } else {
+            btnAuto.innerHTML = '<i class="fas fa-stop"></i> 停止發送';
+            btnAuto.classList.replace('bg-slate-600', 'bg-slate-500');
+            
+            autoInterval = setInterval(() => {
+                const users = ['Alice', 'Bob', 'Charlie'];
+                const randomUser = users[Math.floor(Math.random() * users.length)];
+                fireEvent(randomUser);
+            }, 800);
+        }
+    });
+
+</script>
+</body>
+</html>

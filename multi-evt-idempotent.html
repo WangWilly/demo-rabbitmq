@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RabbitMQ 有序性與冪等性 (Sequence Control)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8fafc; }
+        .canvas-container { position: relative; width: 100%; height: 350px; background: #ffffff; border-radius: 0.5rem; border: 1px solid #e2e8f0; }
+        canvas { display: block; width: 100%; height: 100%; border-radius: 0.5rem; }
+        
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        
+        /* 震動錯誤效果 */
+        @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+        .error-shake { animation: shake 0.3s ease-in-out; border-color: #ef4444; background-color: #fee2e2; }
+        
+        /* 狀態更新高亮 */
+        @keyframes highlightUpdate { 0% { background-color: #fef08a; } 100% { background-color: transparent; } }
+        .update-flash { animation: highlightUpdate 1s ease-out; }
+    </style>
+</head>
+<body class="p-4 flex flex-col gap-5 min-h-screen">
+
+    <header class="max-w-7xl mx-auto w-full bg-white rounded-xl shadow-sm border border-slate-200 p-5 shrink-0">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-100 pb-4 mb-4">
+            <div>
+                <h1 class="text-2xl font-black text-slate-800 flex items-center gap-2">
+                    <i class="fas fa-sort-numeric-down text-indigo-500"></i> 多事件有序性與冪等性防護
+                </h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    解決多 Consumer 帶來的「順序錯亂 (Out-of-Order)」問題。透過<b>事件序號 (Sequence ID)</b> 實現完美的有序與去重。
+                </p>
+            </div>
+            <button onclick="location.reload()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm transition">
+                <i class="fas fa-undo"></i> 重置場景
+            </button>
+        </div>
+        
+        <div class="bg-indigo-50 p-4 rounded-lg border border-indigo-100 flex flex-col md:flex-row items-center justify-between gap-4">
+            <div class="text-sm text-indigo-900 font-medium">
+                <b>情境模擬：</b> 同一個 User 連續發出兩個事件：<br>
+                1️⃣ <span class="bg-blue-200 px-1 rounded text-blue-800 text-xs">Seq: 1</span> <b>建立帳戶 (耗時 2 秒)</b><br>
+                2️⃣ <span class="bg-purple-200 px-1 rounded text-purple-800 text-xs">Seq: 2</span> <b>儲值 $100 (耗時 0.5 秒)</b>
+            </div>
+            <button id="btn-fire" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-xl shadow-md font-bold transition flex items-center gap-2 whitespace-nowrap">
+                <i class="fas fa-play"></i> 同時發送連續事件
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-2 gap-6 flex-grow">
+        
+        <!-- 左側：無序處理 (Naive) -->
+        <section class="flex flex-col bg-white rounded-xl shadow border-t-4 border-t-red-500 overflow-hidden">
+            <div class="p-3 bg-red-50 border-b border-red-100 flex justify-between items-center shrink-0">
+                <h2 class="font-bold text-red-800 flex items-center gap-2">
+                    <i class="fas fa-times-circle"></i> 無防護 (競爭導致順序錯亂)
+                </h2>
+                <span class="bg-red-200 text-red-800 text-[10px] px-2 py-0.5 rounded font-bold">❌ 發生 Data Inconsistency</span>
+            </div>
+
+            <div class="canvas-container" id="naive-wrapper">
+                <canvas id="naive-canvas"></canvas>
+            </div>
+
+            <div class="grid grid-cols-2 border-b border-slate-100 bg-slate-50 shrink-0 h-24">
+                <div id="naive-db" class="p-3 border-r border-slate-200 flex flex-col justify-center transition-colors">
+                    <div class="text-xs font-bold text-slate-500 mb-1 flex items-center gap-1"><i class="fas fa-database"></i> DB User 資料</div>
+                    <div class="text-sm">狀態：<span id="naive-state" class="font-bold text-slate-400">不存在</span></div>
+                    <div class="text-sm">餘額：<span id="naive-balance" class="font-bold text-slate-400">N/A</span></div>
+                </div>
+                <div class="p-3 flex items-center justify-center bg-red-50/50">
+                    <div id="naive-error" class="text-xs font-bold text-red-600 text-center opacity-0 transition-opacity">
+                        <i class="fas fa-exclamation-triangle text-xl block mb-1"></i>
+                        系統崩潰：無法為不存在的帳戶儲值！
+                    </div>
+                </div>
+            </div>
+
+            <div class="h-48 bg-slate-900 p-2 flex flex-col shrink-0">
+                <div class="text-slate-400 text-[10px] font-mono border-b border-slate-700 pb-1 mb-1">Application Log</div>
+                <div id="naive-log" class="custom-scrollbar overflow-y-auto flex-grow font-mono text-[10px] flex flex-col gap-1 p-1"></div>
+            </div>
+        </section>
+
+        <!-- 右側：序號機制防護 (Safe) -->
+        <section class="flex flex-col bg-white rounded-xl shadow border-t-4 border-t-green-500 overflow-hidden">
+            <div class="p-3 bg-green-50 border-b border-green-100 flex justify-between items-center shrink-0">
+                <h2 class="font-bold text-green-800 flex items-center gap-2">
+                    <i class="fas fa-check-circle"></i> 序號檢查機制 (Sequence ID)
+                </h2>
+                <span class="bg-green-200 text-green-800 text-[10px] px-2 py-0.5 rounded font-bold">✅ 完美保證順序與冪等性</span>
+            </div>
+
+            <div class="canvas-container" id="safe-wrapper">
+                <canvas id="safe-canvas"></canvas>
+            </div>
+
+            <div class="grid grid-cols-2 border-b border-slate-100 bg-slate-50 shrink-0 h-24">
+                <div id="safe-db" class="p-3 border-r border-slate-200 flex flex-col justify-center transition-colors">
+                    <div class="text-xs font-bold text-slate-500 mb-1 flex items-center gap-1"><i class="fas fa-database"></i> DB User 資料</div>
+                    <div class="flex justify-between">
+                        <div class="text-sm">狀態：<span id="safe-state" class="font-bold text-slate-400">不存在</span></div>
+                        <div class="text-sm">餘額：<span id="safe-balance" class="font-bold text-slate-400">N/A</span></div>
+                    </div>
+                </div>
+                <div class="p-3 flex flex-col justify-center bg-indigo-50/50">
+                    <div class="text-[10px] font-bold text-indigo-800 mb-1">DB 當前期望序號 (Expected Seq)</div>
+                    <div class="flex items-center gap-2">
+                        <span id="safe-expected-seq" class="text-2xl font-black text-indigo-600 bg-white px-3 rounded shadow-sm border border-indigo-200">1</span>
+                        <span class="text-[10px] text-indigo-500 leading-tight">必須嚴格等於<br>才允許執行</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="h-48 bg-slate-900 p-2 flex flex-col shrink-0">
+                <div class="text-slate-400 text-[10px] font-mono border-b border-slate-700 pb-1 mb-1">Application Log</div>
+                <div id="safe-log" class="custom-scrollbar overflow-y-auto flex-grow font-mono text-[10px] flex flex-col gap-1 p-1"></div>
+            </div>
+        </section>
+
+    </main>
+
+<script>
+    // --- 系統狀態與資料庫模擬 ---
+    const dbNaive = { exist: false, balance: 0 };
+    const dbSafe = { exist: false, balance: 0, expectedSeq: 1 };
+
+    function updateDBUI(type) {
+        if (type === 'naive') {
+            const container = document.getElementById('naive-db');
+            container.classList.remove('update-flash'); void container.offsetWidth; container.classList.add('update-flash');
+            
+            document.getElementById('naive-state').textContent = dbNaive.exist ? '✅ 已建立' : '不存在';
+            document.getElementById('naive-state').className = `font-bold ${dbNaive.exist ? 'text-green-600' : 'text-slate-400'}`;
+            document.getElementById('naive-balance').textContent = dbNaive.exist ? `$${dbNaive.balance}` : 'N/A';
+            document.getElementById('naive-balance').className = `font-bold ${dbNaive.balance > 0 ? 'text-blue-600' : 'text-slate-400'}`;
+        } else {
+            const container = document.getElementById('safe-db');
+            container.classList.remove('update-flash'); void container.offsetWidth; container.classList.add('update-flash');
+            
+            document.getElementById('safe-state').textContent = dbSafe.exist ? '✅ 已建立' : '不存在';
+            document.getElementById('safe-state').className = `font-bold ${dbSafe.exist ? 'text-green-600' : 'text-slate-400'}`;
+            document.getElementById('safe-balance').textContent = dbSafe.exist ? `$${dbSafe.balance}` : 'N/A';
+            document.getElementById('safe-balance').className = `font-bold ${dbSafe.balance > 0 ? 'text-blue-600' : 'text-slate-400'}`;
+            document.getElementById('safe-expected-seq').textContent = dbSafe.expectedSeq;
+        }
+    }
+
+    function addLog(target, source, msg, level = 'info') {
+        const container = document.getElementById(`${target}-log`);
+        const el = document.createElement('div');
+        
+        let color = 'text-slate-300';
+        if (level === 'error') color = 'text-red-400 bg-red-900/30';
+        if (level === 'success') color = 'text-green-400';
+        if (level === 'warn') color = 'text-yellow-400';
+        if (level === 'sys') color = 'text-indigo-300 font-bold';
+
+        el.className = `flex gap-2 rounded px-1 py-0.5 ${color}`;
+        el.innerHTML = `
+            <span class="text-slate-500 shrink-0">[${new Date().toISOString().substring(17,23)}]</span>
+            <span class="shrink-0 w-8 font-bold">[${source}]</span>
+            <span class="break-all">${msg}</span>
+        `;
+        container.appendChild(el);
+        container.scrollTop = container.scrollHeight;
+    }
+
+
+    // --- 核心 Canvas 動畫與流程引擎 ---
+    class OrderedEngine {
+        constructor(canvasId, wrapperId, type) {
+            this.canvas = document.getElementById(canvasId);
+            this.ctx = this.canvas.getContext('2d');
+            this.wrapper = document.getElementById(wrapperId);
+            this.type = type;
+            
+            this.width = 0;
+            this.height = 0;
+            
+            this.queue = [];      // RabbitMQ 佇列
+            this.particles = [];  // 動畫物件
+            this.texts = [];      // 浮動文字
+            
+            this.consumers = [
+                { id: 'C1', isBusy: false, yOffset: -50, color: '#3b82f6' },
+                { id: 'C2', isBusy: false, yOffset: 50, color: '#a855f7' }
+            ];
+            
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
+        }
+
+        resize() {
+            const rect = this.wrapper.getBoundingClientRect();
+            this.canvas.width = rect.width * window.devicePixelRatio;
+            this.canvas.height = rect.height * window.devicePixelRatio;
+            this.ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            this.width = rect.width;
+            this.height = rect.height;
+        }
+
+        addText(text, x, y, color) {
+            this.texts.push({ text, x, y, color, life: 60 });
+        }
+
+        publish(msgObj) {
+            this.particles.push({
+                ...msgObj,
+                x: 20, y: this.height / 2, 
+                targetX: this.width / 2 - 50, targetY: this.height / 2, // MQ
+                state: 'to_mq',
+                consumerRef: null, timer: 0
+            });
+            addLog(this.type, 'MQ', `收到新事件 ${msgObj.name} (Seq: ${msgObj.seq})`);
+        }
+
+        update() {
+            const cx = this.width / 2;
+            const cy = this.height / 2;
+            const mqX = cx - 50;
+            const cX = cx + 80;
+
+            // 浮動文字
+            for (let i = this.texts.length - 1; i >= 0; i--) {
+                this.texts[i].life--;
+                this.texts[i].y -= 0.5;
+                if (this.texts[i].life <= 0) this.texts.splice(i, 1);
+            }
+
+            // 動畫物件狀態機
+            for (let i = this.particles.length - 1; i >= 0; i--) {
+                const p = this.particles[i];
+
+                if (p.state === 'to_mq') {
+                    p.x += (p.targetX - p.x) * 0.15;
+                    if (Math.abs(p.targetX - p.x) < 2) {
+                        p.state = 'in_queue';
+                        this.queue.push(p); // 進入佇列等待派發
+                    }
+                } 
+                else if (p.state === 'to_consumer') {
+                    p.x += (p.targetX - p.x) * 0.15;
+                    p.y += (p.targetY - p.y) * 0.15;
+                    if (Math.hypot(p.targetX - p.x, p.targetY - p.y) < 2) {
+                        p.state = 'processing';
+                        p.timer = 0;
+                        addLog(this.type, p.consumerRef.id, `開始處理 ${p.name} (Seq: ${p.seq})`);
+                    }
+                }
+                else if (p.state === 'processing') {
+                    p.timer++;
+                    // 模擬耗時：Create (慢), Deposit (快)
+                    const processTime = p.type === 'CREATE' ? 120 : 30; 
+                    
+                    if (p.timer >= processTime) {
+                        // 處理邏輯
+                        this.executeLogic(p, i);
+                    }
+                }
+                else if (p.state === 'to_mq_ack' || p.state === 'requeueing') {
+                    p.x += (p.targetX - p.x) * 0.15;
+                    p.y += (p.targetY - p.y) * 0.15;
+                    if (Math.hypot(p.targetX - p.x, p.targetY - p.y) < 2) {
+                        if (p.state === 'requeueing') {
+                            addLog(this.type, 'MQ', `事件 (Seq: ${p.seq}) 已退回佇列頭部等待重試`);
+                            p.state = 'in_queue';
+                            this.queue.unshift(p); // 塞回頭部重試
+                        } else {
+                            addLog(this.type, 'MQ', `收到 ACK，刪除 Seq: ${p.seq}`);
+                            this.particles.splice(i, 1); // 真正結束
+                        }
+                    }
+                }
+                else if (p.state === 'failed') {
+                    // 崩潰，卡在畫面上展示錯誤
+                }
+            }
+
+            // Broker 派發邏輯 (Push)
+            if (this.queue.length > 0) {
+                // 找空閒的 Consumer
+                const freeConsumer = this.consumers.find(c => !c.isBusy);
+                if (freeConsumer) {
+                    const msgToDeliver = this.queue.shift(); // 從佇列拿一個
+                    freeConsumer.isBusy = true;
+                    
+                    msgToDeliver.state = 'to_consumer';
+                    msgToDeliver.targetX = cX - 20;
+                    msgToDeliver.targetY = cy + freeConsumer.yOffset;
+                    msgToDeliver.consumerRef = freeConsumer;
+                    
+                    addLog(this.type, 'MQ', `派發 (Seq: ${msgToDeliver.seq}) 給 ${freeConsumer.id}`);
+                }
+            }
+        }
+
+        executeLogic(p, particleIndex) {
+            const consumerId = p.consumerRef.id;
+            
+            // ================= 核心商業邏輯差異 =================
+            if (this.type === 'naive') {
+                if (p.type === 'CREATE') {
+                    dbNaive.exist = true;
+                    updateDBUI('naive');
+                    this.addText(`✅ 建立成功`, p.x, p.y - 20, '#10b981');
+                    addLog('naive', consumerId, `帳戶建立成功，回傳 ACK`, 'success');
+                    this.finishTask(p, true);
+                } 
+                else if (p.type === 'DEPOSIT') {
+                    if (!dbNaive.exist) {
+                        // 災難發生：因為順序錯亂，嘗試儲值給不存在的帳戶
+                        this.addText(`❌ DB Exception`, p.x, p.y - 20, '#ef4444');
+                        addLog('naive', consumerId, `嚴重錯誤：User 不存在，無法儲值！`, 'error');
+                        
+                        document.getElementById('naive-wrapper').classList.add('error-shake');
+                        document.getElementById('naive-error').classList.remove('opacity-0');
+                        p.state = 'failed';
+                        p.consumerRef.isBusy = false; // 釋放
+                    } else {
+                        dbNaive.balance += p.amount;
+                        updateDBUI('naive');
+                        this.addText(`+$${p.amount}`, p.x, p.y - 20, '#3b82f6');
+                        addLog('naive', consumerId, `儲值成功，回傳 ACK`, 'success');
+                        this.finishTask(p, true);
+                    }
+                }
+            } 
+            
+            else if (this.type === 'safe') {
+                // 序號機制 (Sequence ID) 邏輯判斷
+                const msgSeq = p.seq;
+                const dbSeq = dbSafe.expectedSeq;
+
+                addLog('safe', consumerId, `驗證序號 -> 訊息 Seq:${msgSeq}, DB 期望 Seq:${dbSeq}`, 'sys');
+
+                if (msgSeq === dbSeq) {
+                    // 【正常有序執行】
+                    if (p.type === 'CREATE') dbSafe.exist = true;
+                    if (p.type === 'DEPOSIT') dbSafe.balance += p.amount;
+                    
+                    dbSafe.expectedSeq++; // 序號推進！
+                    updateDBUI('safe');
+                    
+                    this.addText(`執行成功 (Seq+1)`, p.x, p.y - 20, '#10b981');
+                    addLog('safe', consumerId, `序號正確，執行成功，回傳 ACK`, 'success');
+                    this.finishTask(p, true);
+                } 
+                else if (msgSeq < dbSeq) {
+                    // 【冪等性保護】收到舊的序號 (可能因為重連導致的重複發送)
+                    this.addText(`🛡️ 重複忽略`, p.x, p.y - 20, '#64748b');
+                    addLog('safe', consumerId, `序號小於期望值 (${msgSeq} < ${dbSeq})，視為重複處理，直接忽略並 ACK`, 'warn');
+                    this.finishTask(p, true);
+                }
+                else if (msgSeq > dbSeq) {
+                    // 【順序保護】未來的序號先到了 (Out-of-Order)
+                    this.addText(`⚠️ 順序錯誤 (退回)`, p.x, p.y - 20, '#f59e0b');
+                    addLog('safe', consumerId, `序號大於期望值 (${msgSeq} > ${dbSeq})，前置事件尚未完成。觸發 NACK 退回重試！`, 'error');
+                    this.finishTask(p, false); // false = Requeue
+                }
+            }
+        }
+
+        finishTask(p, success) {
+            p.consumerRef.isBusy = false; // 釋放 Consumer 資源
+            
+            if (success) {
+                p.state = 'to_mq_ack';
+                p.targetX = this.width / 2 - 50;
+                p.targetY = this.height / 2;
+            } else {
+                p.state = 'requeueing';
+                p.targetX = this.width / 2 - 50;
+                p.targetY = this.height / 2;
+            }
+        }
+
+        draw() {
+            this.ctx.clearRect(0, 0, this.width, this.height);
+            const cx = this.width / 2;
+            const cy = this.height / 2;
+            const mqX = cx - 50;
+            const cX = cx + 80;
+
+            // --- 連線 ---
+            this.ctx.strokeStyle = '#cbd5e1'; this.ctx.lineWidth = 2;
+            this.ctx.beginPath(); this.ctx.moveTo(mqX + 20, cy); this.ctx.lineTo(cX - 30, cy + this.consumers[0].yOffset); this.ctx.stroke();
+            this.ctx.beginPath(); this.ctx.moveTo(mqX + 20, cy); this.ctx.lineTo(cX - 30, cy + this.consumers[1].yOffset); this.ctx.stroke();
+
+            // --- MQ 區塊 ---
+            this.ctx.fillStyle = '#fff'; this.ctx.strokeStyle = '#f97316'; this.ctx.lineWidth = 2;
+            this.ctx.beginPath(); this.ctx.roundRect(mqX - 30, cy - 60, 60, 120, 6); this.ctx.fill(); this.ctx.stroke();
+            this.ctx.fillStyle = '#334155'; this.ctx.font = 'bold 12px sans-serif'; this.ctx.textAlign = 'center';
+            this.ctx.fillText('Queue', mqX, cy - 70);
+
+            // 畫佇列中排隊的任務 (視覺化)
+            this.queue.forEach((item, idx) => {
+                const drawY = cy - 40 + (idx * 20);
+                if (drawY < cy + 50) {
+                    this.ctx.fillStyle = item.color;
+                    this.ctx.beginPath(); this.ctx.arc(mqX, drawY, 6, 0, Math.PI*2); this.ctx.fill();
+                    this.ctx.fillStyle = '#fff'; this.ctx.font = '8px monospace'; this.ctx.fillText(item.seq, mqX, drawY+3);
+                }
+            });
+
+            // --- Consumers ---
+            this.consumers.forEach(c => {
+                const drawY = cy + c.yOffset;
+                this.ctx.fillStyle = '#fff'; this.ctx.strokeStyle = c.color; this.ctx.lineWidth = c.isBusy ? 3 : 1;
+                this.ctx.beginPath(); this.ctx.roundRect(cX - 40, drawY - 25, 80, 50, 6); this.ctx.fill(); this.ctx.stroke();
+                this.ctx.fillStyle = '#334155'; this.ctx.font = 'bold 12px sans-serif'; this.ctx.textAlign = 'center';
+                this.ctx.fillText(`Consumer ${c.id}`, cX, drawY + 5);
+            });
+
+            // --- 飛行的事件與特效 ---
+            this.particles.forEach(p => {
+                if (p.state === 'in_queue') return; // 在佇列中由 MQ 區塊繪製
+
+                let color = p.color;
+                let icon = p.seq;
+                
+                if (p.state === 'to_mq_ack') { color = '#10b981'; icon = '✅'; }
+                if (p.state === 'requeueing') { color = '#f59e0b'; icon = '⚠️'; }
+                if (p.state === 'failed') { color = '#ef4444'; icon = '❌'; }
+
+                this.ctx.fillStyle = color;
+                this.ctx.beginPath(); this.ctx.arc(p.x, p.y, 12, 0, Math.PI*2); this.ctx.fill();
+                
+                this.ctx.fillStyle = '#fff'; this.ctx.font = 'bold 12px monospace'; this.ctx.textAlign = 'center'; this.ctx.textBaseline = 'middle';
+                this.ctx.fillText(icon, p.x, p.y);
+                this.ctx.textBaseline = 'alphabetic';
+                
+                // 標示名稱
+                if (p.state !== 'to_mq_ack' && p.state !== 'requeueing' && p.state !== 'failed') {
+                    this.ctx.fillStyle = '#64748b'; this.ctx.font = '9px sans-serif';
+                    this.ctx.fillText(p.name, p.x, p.y + 22);
+                }
+
+                // 處理中轉圈特效
+                if (p.state === 'processing') {
+                    this.ctx.strokeStyle = p.color; this.ctx.lineWidth = 2;
+                    this.ctx.beginPath(); this.ctx.arc(p.x, p.y, 16 + (p.timer % 15)/3, 0, Math.PI*2); this.ctx.stroke();
+                    
+                    // 畫一個進度條
+                    const maxT = p.type === 'CREATE' ? 120 : 30;
+                    this.ctx.fillStyle = '#e2e8f0'; this.ctx.fillRect(p.x - 15, p.y + 25, 30, 4);
+                    this.ctx.fillStyle = p.color; this.ctx.fillRect(p.x - 15, p.y + 25, 30 * (p.timer/maxT), 4);
+                }
+            });
+
+            // --- 浮動文字 ---
+            this.texts.forEach(ft => {
+                this.ctx.globalAlpha = ft.life / 60;
+                this.ctx.fillStyle = ft.color;
+                this.ctx.font = 'bold 14px sans-serif';
+                this.ctx.textAlign = 'center';
+                this.ctx.fillText(ft.text, ft.x, ft.y);
+                this.ctx.globalAlpha = 1;
+            });
+        }
+    }
+
+    // --- 系統啟動 ---
+    const engineNaive = new OrderedEngine('naive-canvas', 'naive-wrapper', 'naive');
+    const engineSafe = new OrderedEngine('safe-canvas', 'safe-wrapper', 'safe');
+
+    function animate() {
+        engineNaive.update(); engineNaive.draw();
+        engineSafe.update(); engineSafe.draw();
+        requestAnimationFrame(animate);
+    }
+    animate();
+
+    // 觸發事件按鈕
+    document.getElementById('btn-fire').addEventListener('click', () => {
+        // 重置 UI 與 DB
+        dbNaive.exist = false; dbNaive.balance = 0;
+        dbSafe.exist = false; dbSafe.balance = 0; dbSafe.expectedSeq = 1;
+        updateDBUI('naive'); updateDBUI('safe');
+        document.getElementById('naive-error').classList.add('opacity-0');
+        
+        // 清理殘留動畫
+        engineNaive.queue = []; engineNaive.particles = []; engineNaive.consumers.forEach(c => c.isBusy=false);
+        engineSafe.queue = []; engineSafe.particles = []; engineSafe.consumers.forEach(c => c.isBusy=false);
+        document.getElementById('naive-log').innerHTML = '';
+        document.getElementById('safe-log').innerHTML = '';
+
+        // 產生兩個連續事件
+        const event1 = { seq: 1, type: 'CREATE', name: 'Create', color: '#3b82f6' };
+        const event2 = { seq: 2, type: 'DEPOSIT', name: 'Deposit $100', color: '#a855f7', amount: 100 };
+
+        // 故意讓事件2 幾乎同時進去，觸發併發派發
+        setTimeout(() => {
+            engineNaive.publish({...event1});
+            engineSafe.publish({...event1});
+        }, 0);
+
+        setTimeout(() => {
+            engineNaive.publish({...event2});
+            engineSafe.publish({...event2});
+        }, 100); // 100ms 後發送 Event2，確保 Event1 先發但還沒處理完
+    });
+
+</script>
+</body>
+</html>

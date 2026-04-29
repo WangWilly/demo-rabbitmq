@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>高併發冪等性防護 (Race Condition)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f1f5f9; }
+        .canvas-container { position: relative; width: 100%; height: 320px; background: #ffffff; border-radius: 0.5rem; border: 1px solid #e2e8f0; }
+        canvas { display: block; width: 100%; height: 100%; border-radius: 0.5rem; }
+        
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f8fafc; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        
+        @keyframes popGreen { 0% { transform: scale(1); color: #10b981; } 50% { transform: scale(1.2); color: #10b981; } 100% { transform: scale(1); } }
+        @keyframes popRed { 0% { transform: scale(1); color: #ef4444; } 50% { transform: scale(1.2); color: #ef4444; } 100% { transform: scale(1); } }
+        .balance-pop-green { animation: popGreen 0.4s ease-out; }
+        .balance-pop-red { animation: popRed 0.4s ease-out; }
+    </style>
+</head>
+<body class="p-4 flex flex-col gap-4 min-h-screen">
+
+    <header class="max-w-7xl mx-auto w-full bg-white rounded-xl shadow-sm border border-slate-200 p-5 shrink-0">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4 border-b border-slate-100 pb-4">
+            <div>
+                <h1 class="text-2xl font-black text-slate-800 flex items-center gap-2">
+                    <i class="fas fa-bolt text-yellow-500"></i> 高併發冪等性防護 (Race Condition)
+                </h1>
+                <p class="text-sm text-slate-500 mt-1">
+                    當兩個 Consumer <b>同時</b>收到相同訊息時，傳統的「先檢查再執行 (Check-then-Act)」會失效。<br>
+                    必須使用 Redis <b>SETNX (Set if Not eXists) 分散式鎖</b> 或是 DB Unique Key 來保證原子性。
+                </p>
+            </div>
+            <button onclick="location.reload()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm transition shrink-0">
+                <i class="fas fa-undo"></i> 重置場景
+            </button>
+        </div>
+        
+        <div class="flex gap-4 items-center">
+            <button id="btn-race" class="bg-red-600 hover:bg-red-700 text-white px-5 py-2.5 rounded-lg shadow font-bold transition flex items-center gap-2">
+                <i class="fas fa-fighter-jet"></i> 觸發高併發競爭 (同時派發重複訊息)
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-2 gap-6 flex-grow">
+        
+        <!-- 左側：Check-then-Act (破綻百出) -->
+        <section class="flex flex-col bg-white rounded-xl shadow border-t-4 border-t-red-500 overflow-hidden">
+            <div class="p-3 bg-red-50 border-b border-red-100 flex justify-between items-center shrink-0">
+                <h2 class="font-bold text-red-800 flex items-center gap-2">
+                    <i class="fas fa-times-circle"></i> 傳統「先查後寫」(Check-then-Act)
+                </h2>
+                <span class="bg-red-200 text-red-800 text-[10px] px-2 py-0.5 rounded font-bold">❌ 併發時必定重複扣款</span>
+            </div>
+
+            <div class="canvas-container" id="naive-wrapper">
+                <canvas id="naive-canvas"></canvas>
+            </div>
+
+            <div class="grid grid-cols-2 border-b border-slate-100 bg-slate-50 shrink-0">
+                <div class="p-4 border-r border-slate-200 flex flex-col items-center justify-center">
+                    <i class="fas fa-database text-slate-400 text-2xl mb-1"></i>
+                    <div class="text-xs font-bold text-slate-500">DB 餘額</div>
+                    <div id="naive-balance" class="text-2xl font-black text-slate-800 my-1">$1000</div>
+                    <div id="naive-warning" class="hidden text-[10px] bg-red-100 text-red-700 px-2 py-1 rounded font-bold border border-red-300">
+                        ⚠️ 發生重複扣款！
+                    </div>
+                </div>
+                <div class="p-4 flex flex-col items-center justify-center">
+                    <i class="fas fa-server text-red-400 text-2xl mb-1"></i>
+                    <div class="text-xs font-bold text-slate-500">Redis (GET / SET)</div>
+                    <div id="naive-redis" class="mt-1 text-xs font-mono text-slate-500 italic h-6">空</div>
+                </div>
+            </div>
+
+            <div class="h-48 bg-slate-900 p-2 flex flex-col shrink-0">
+                <div class="text-slate-400 text-[10px] font-mono border-b border-slate-700 pb-1 mb-1 flex gap-4">
+                    <span class="text-blue-300">C1 Log</span> | <span class="text-purple-300">C2 Log</span>
+                </div>
+                <div id="naive-log" class="custom-scrollbar overflow-y-auto flex-grow font-mono text-[10px] flex flex-col gap-1 p-1"></div>
+            </div>
+        </section>
+
+        <!-- 右側：Atomic SETNX (安全) -->
+        <section class="flex flex-col bg-white rounded-xl shadow border-t-4 border-t-green-500 overflow-hidden">
+            <div class="p-3 bg-green-50 border-b border-green-100 flex justify-between items-center shrink-0">
+                <h2 class="font-bold text-green-800 flex items-center gap-2">
+                    <i class="fas fa-check-circle"></i> 原子操作鎖 (Atomic SETNX)
+                </h2>
+                <span class="bg-green-200 text-green-800 text-[10px] px-2 py-0.5 rounded font-bold">✅ 完美防禦</span>
+            </div>
+
+            <div class="canvas-container" id="safe-wrapper">
+                <canvas id="safe-canvas"></canvas>
+            </div>
+
+            <div class="grid grid-cols-2 border-b border-slate-100 bg-slate-50 shrink-0">
+                <div class="p-4 border-r border-slate-200 flex flex-col items-center justify-center">
+                    <i class="fas fa-database text-slate-400 text-2xl mb-1"></i>
+                    <div class="text-xs font-bold text-slate-500">DB 餘額</div>
+                    <div id="safe-balance" class="text-2xl font-black text-slate-800 my-1">$1000</div>
+                    <div id="safe-success" class="hidden text-[10px] bg-green-100 text-green-700 px-2 py-1 rounded font-bold border border-green-300">
+                        ✅ 餘額正確
+                    </div>
+                </div>
+                <div class="p-4 flex flex-col items-center justify-center">
+                    <i class="fas fa-server text-green-500 text-2xl mb-1"></i>
+                    <div class="text-xs font-bold text-slate-500">Redis (SETNX Lock)</div>
+                    <div id="safe-redis" class="mt-1 text-xs font-mono text-green-600 font-bold h-6">空</div>
+                </div>
+            </div>
+
+            <div class="h-48 bg-slate-900 p-2 flex flex-col shrink-0">
+                <div class="text-slate-400 text-[10px] font-mono border-b border-slate-700 pb-1 mb-1 flex gap-4">
+                    <span class="text-blue-300">C1 Log</span> | <span class="text-purple-300">C2 Log</span>
+                </div>
+                <div id="safe-log" class="custom-scrollbar overflow-y-auto flex-grow font-mono text-[10px] flex flex-col gap-1 p-1"></div>
+            </div>
+        </section>
+
+    </main>
+
+<script>
+    // --- 共用狀態 ---
+    let orderCounter = 2000;
+    let naiveBalance = 1000;
+    let safeBalance = 1000;
+    let correctBalance = 1000;
+    
+    // 模擬 Redis 狀態
+    let redisNaive = null; 
+    let redisSafe = null;
+
+    function updateBalanceUI(type, amount) {
+        if(type === 'naive') {
+            naiveBalance -= amount;
+            const el = document.getElementById('naive-balance');
+            el.textContent = `$${naiveBalance}`;
+            el.classList.remove('balance-pop-red', 'balance-pop-green'); void el.offsetWidth; 
+            if (naiveBalance < correctBalance) {
+                el.classList.add('balance-pop-red');
+                document.getElementById('naive-warning').classList.remove('hidden');
+            } else { el.classList.add('balance-pop-green'); }
+        } else {
+            safeBalance -= amount;
+            const el = document.getElementById('safe-balance');
+            el.textContent = `$${safeBalance}`;
+            el.classList.remove('balance-pop-green'); void el.offsetWidth; el.classList.add('balance-pop-green');
+            if (safeBalance === correctBalance) {
+                document.getElementById('safe-success').classList.remove('hidden');
+            }
+        }
+    }
+
+    function addLog(target, consumerId, msg, type = 'normal') {
+        const container = document.getElementById(`${target}-log`);
+        const el = document.createElement('div');
+        
+        let colorClass = consumerId === 'C1' ? 'text-blue-300' : 'text-purple-300';
+        if (type === 'error') colorClass = 'text-red-400 bg-red-900/30';
+        if (type === 'success') colorClass = 'text-green-400';
+        if (type === 'warn') colorClass = 'text-yellow-400';
+
+        el.className = `flex gap-2 rounded px-1 py-0.5 ${colorClass}`;
+        el.innerHTML = `
+            <span class="text-slate-500 shrink-0">[${new Date().toISOString().substring(14,23)}]</span>
+            <span class="shrink-0 w-8 font-bold">[${consumerId}]</span>
+            <span class="break-all">${msg}</span>
+        `;
+        container.appendChild(el);
+        container.scrollTop = container.scrollHeight;
+    }
+
+
+    // --- Canvas 動畫引擎 ---
+    class ConcurrencyEngine {
+        constructor(canvasId, type) {
+            this.canvas = document.getElementById(canvasId);
+            this.ctx = this.canvas.getContext('2d');
+            this.type = type; // 'naive' or 'safe'
+            
+            this.width = 0;
+            this.height = 0;
+            
+            this.particles = [];
+            this.texts = [];
+            
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
+        }
+
+        resize() {
+            const rect = this.canvas.parentElement.getBoundingClientRect();
+            this.canvas.width = rect.width * window.devicePixelRatio;
+            this.canvas.height = rect.height * window.devicePixelRatio;
+            this.ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            this.width = rect.width;
+            this.height = rect.height;
+        }
+
+        addFloatingText(text, x, y, color) {
+            this.texts.push({ text, x, y, color, life: 60 });
+        }
+
+        // 觸發高併發：同時派出兩顆粒子給 C1 和 C2
+        triggerRace(msgId) {
+            const startX = this.width / 2;
+            const startY = 30; // MQ
+            
+            // 任務狀態機：
+            // to_consumer -> querying_redis -> db_op -> writing_redis -> done
+            this.particles.push({ id: msgId, consumer: 'C1', color: '#3b82f6', x: startX, y: startY, targetX: this.width/4, targetY: 100, timer: 0, state: 'to_consumer' });
+            this.particles.push({ id: msgId, consumer: 'C2', color: '#a855f7', x: startX, y: startY, targetX: (this.width/4)*3, targetY: 100, timer: 0, state: 'to_consumer' });
+            
+            addLog(this.type, 'MQ', `偵測到異常/重送，${msgId} 同時派發給 C1 與 C2!`, 'warn');
+        }
+
+        update() {
+            const cx = this.width / 2;
+            
+            // 處理浮動文字
+            for (let i = this.texts.length - 1; i >= 0; i--) {
+                this.texts[i].life--;
+                this.texts[i].y -= 0.5;
+                if (this.texts[i].life <= 0) this.texts.splice(i, 1);
+            }
+
+            // 處理粒子狀態機 (模擬同步/非同步的 Race Condition)
+            for (let i = this.particles.length - 1; i >= 0; i--) {
+                const p = this.particles[i];
+                p.timer++;
+
+                if (p.state === 'to_consumer') {
+                    p.x += (p.targetX - p.x) * 0.15;
+                    p.y += (p.targetY - p.y) * 0.15;
+                    if (Math.hypot(p.targetX - p.x, p.targetY - p.y) < 2) {
+                        p.state = 'querying_redis';
+                        p.timer = 0;
+                    }
+                }
+                
+                // --- 核心邏輯演練區 ---
+                if (this.type === 'naive') {
+                    if (p.state === 'querying_redis' && p.timer === 30) {
+                        // 1. GET 查詢階段：兩人都在此時查 Redis
+                        // 因為兩人都還沒寫入，所以兩人都會得到 null
+                        const hasRecord = (redisNaive === p.id);
+                        addLog('naive', p.consumer, `GET(${p.id}) -> ${hasRecord ? 'Found' : 'Null'}`);
+                        
+                        this.addFloatingText(`GET: Null`, p.x, p.y - 15, '#64748b');
+                        
+                        p.state = 'db_op';
+                        p.timer = 0;
+                    }
+                    else if (p.state === 'db_op' && p.timer === 50) {
+                        // 2. 執行 DB 扣款：因為前面拿到 null，兩人都認為自己是第一個
+                        updateBalanceUI('naive', 100);
+                        this.addFloatingText(`-$100`, p.x, p.y + 35, '#ef4444');
+                        addLog('naive', p.consumer, `無紀錄，執行扣款 $100`, 'error');
+                        
+                        p.state = 'writing_redis';
+                        p.timer = 0;
+                    }
+                    else if (p.state === 'writing_redis' && p.timer === 30) {
+                        // 3. SET 寫入 Redis
+                        redisNaive = p.id;
+                        document.getElementById('naive-redis').textContent = `KEY: ${p.id}`;
+                        addLog('naive', p.consumer, `SET(${p.id}, true)`);
+                        
+                        p.state = 'done';
+                        this.particles.splice(i, 1);
+                    }
+                } 
+                else if (this.type === 'safe') {
+                    // 原子操作 SETNX 模擬 (Redis 單執行緒處理)
+                    // 為了模擬 Redis 的序列化，我們讓到達的瞬間決定勝負
+                    if (p.state === 'querying_redis' && p.timer === 30) {
+                        // 使用一個變數鎖定，誰先判定這行誰就贏
+                        let isLockAcquired = false;
+                        if (redisSafe !== p.id) {
+                            redisSafe = p.id; // 瞬間上鎖 (Atomic)
+                            isLockAcquired = true;
+                            document.getElementById('safe-redis').innerHTML = `🔒 SETNX ${p.id}`;
+                        }
+
+                        if (isLockAcquired) {
+                            // 獲取鎖成功
+                            this.addFloatingText(`SETNX: 1 (成功)`, p.x, p.y - 15, '#10b981');
+                            addLog('safe', p.consumer, `SETNX(${p.id}) -> 1 (成功獲取鎖)`);
+                            p.state = 'db_op';
+                            p.timer = 0;
+                        } else {
+                            // 獲取鎖失敗
+                            this.addFloatingText(`SETNX: 0 (失敗)`, p.x, p.y - 15, '#ef4444');
+                            addLog('safe', p.consumer, `SETNX(${p.id}) -> 0 (已被其他人鎖定)`, 'warn');
+                            addLog('safe', p.consumer, `攔截成功！跳過處理並 ACK。`, 'success');
+                            p.state = 'done';
+                            this.particles.splice(i, 1);
+                        }
+                    }
+                    else if (p.state === 'db_op' && p.timer === 50) {
+                        // 只有獲取鎖的 Consumer 會來到這裡
+                        updateBalanceUI('safe', 100);
+                        this.addFloatingText(`-$100`, p.x, p.y + 35, '#3b82f6');
+                        addLog('safe', p.consumer, `持有鎖，安全執行扣款 $100`, 'success');
+                        
+                        p.state = 'done';
+                        this.particles.splice(i, 1);
+                    }
+                }
+            }
+        }
+
+        draw() {
+            this.ctx.clearRect(0, 0, this.width, this.height);
+            const mqX = this.width / 2;
+            const mqY = 30;
+            const c1X = this.width / 4;
+            const c2X = (this.width / 4) * 3;
+            const cY = 100;
+            const redisY = 220;
+            const dbY = 270;
+
+            // --- 連線 ---
+            this.ctx.strokeStyle = '#cbd5e1'; this.ctx.lineWidth = 1; this.ctx.setLineDash([4, 4]);
+            // MQ to Consumers
+            this.ctx.beginPath(); this.ctx.moveTo(mqX, mqY+20); this.ctx.lineTo(c1X, cY-30); this.ctx.stroke();
+            this.ctx.beginPath(); this.ctx.moveTo(mqX, mqY+20); this.ctx.lineTo(c2X, cY-30); this.ctx.stroke();
+            // Consumers to Redis
+            this.ctx.beginPath(); this.ctx.moveTo(c1X, cY+30); this.ctx.lineTo(mqX, redisY-20); this.ctx.stroke();
+            this.ctx.beginPath(); this.ctx.moveTo(c2X, cY+30); this.ctx.lineTo(mqX, redisY-20); this.ctx.stroke();
+            // Consumers to DB
+            this.ctx.beginPath(); this.ctx.moveTo(c1X, cY+30); this.ctx.lineTo(c1X, dbY-20); this.ctx.stroke();
+            this.ctx.beginPath(); this.ctx.moveTo(c2X, cY+30); this.ctx.lineTo(c2X, dbY-20); this.ctx.stroke();
+            this.ctx.setLineDash([]);
+
+            // --- MQ ---
+            this.ctx.fillStyle = '#fff'; this.ctx.strokeStyle = '#f97316'; this.ctx.lineWidth = 2;
+            this.ctx.beginPath(); this.ctx.roundRect(mqX - 40, mqY - 15, 80, 30, 4); this.ctx.fill(); this.ctx.stroke();
+            this.ctx.fillStyle = '#334155'; this.ctx.font = 'bold 12px sans-serif'; this.ctx.textAlign = 'center'; this.ctx.fillText('RabbitMQ', mqX, mqY + 4);
+
+            // --- Consumers ---
+            const drawC = (x, y, label, color) => {
+                this.ctx.fillStyle = '#fff'; this.ctx.strokeStyle = color; this.ctx.lineWidth = 3;
+                this.ctx.beginPath(); this.ctx.roundRect(x - 30, y - 25, 60, 50, 6); this.ctx.fill(); this.ctx.stroke();
+                this.ctx.fillStyle = '#334155'; this.ctx.font = 'bold 14px sans-serif'; this.ctx.textAlign = 'center'; this.ctx.fillText(label, x, y + 5);
+            };
+            drawC(c1X, cY, 'C1', '#3b82f6');
+            drawC(c2X, cY, 'C2', '#a855f7');
+
+            // --- Redis & DB 圖示 ---
+            this.ctx.font = '24px sans-serif';
+            this.ctx.fillText('💾', mqX, redisY);
+            this.ctx.fillStyle = '#64748b'; this.ctx.font = '10px sans-serif'; this.ctx.fillText('Redis', mqX, redisY + 15);
+            
+            this.ctx.font = '24px sans-serif';
+            this.ctx.fillText('🗄️', c1X, dbY); this.ctx.fillText('🗄️', c2X, dbY);
+            this.ctx.fillStyle = '#64748b'; this.ctx.font = '10px sans-serif'; 
+            this.ctx.fillText('DB Connection', c1X, dbY + 15); this.ctx.fillText('DB Connection', c2X, dbY + 15);
+
+            // --- 動態粒子 ---
+            this.particles.forEach(p => {
+                this.ctx.fillStyle = p.color;
+                this.ctx.beginPath(); this.ctx.arc(p.x, p.y, 10, 0, Math.PI*2); this.ctx.fill();
+                this.ctx.fillStyle = '#fff'; this.ctx.font = '10px sans-serif'; this.ctx.fillText('📩', p.x, p.y+3);
+
+                // 射線動畫 (表示正在連線)
+                if (p.state === 'querying_redis') {
+                    this.ctx.strokeStyle = p.color; this.ctx.lineWidth = 2;
+                    this.ctx.beginPath(); this.ctx.moveTo(p.x, p.y + 15); this.ctx.lineTo(mqX, redisY - 15); this.ctx.stroke();
+                } else if (p.state === 'db_op') {
+                    this.ctx.strokeStyle = p.color; this.ctx.lineWidth = 2;
+                    this.ctx.beginPath(); this.ctx.moveTo(p.x, p.y + 15); this.ctx.lineTo(p.x, dbY - 15); this.ctx.stroke();
+                } else if (p.state === 'writing_redis') {
+                    this.ctx.strokeStyle = p.color; this.ctx.lineWidth = 2; this.ctx.setLineDash([2, 2]);
+                    this.ctx.beginPath(); this.ctx.moveTo(p.x, p.y + 15); this.ctx.lineTo(mqX, redisY - 15); this.ctx.stroke();
+                    this.ctx.setLineDash([]);
+                }
+            });
+
+            // --- 浮動文字 ---
+            this.texts.forEach(ft => {
+                this.ctx.globalAlpha = ft.life / 60;
+                this.ctx.fillStyle = ft.color;
+                this.ctx.font = 'bold 12px sans-serif';
+                this.ctx.textAlign = 'center';
+                this.ctx.fillText(ft.text, ft.x, ft.y);
+                this.ctx.globalAlpha = 1;
+            });
+        }
+    }
+
+    // --- 啟動 ---
+    const engineNaive = new ConcurrencyEngine('naive-canvas', 'naive');
+    const engineSafe = new ConcurrencyEngine('safe-canvas', 'safe');
+
+    function animate() {
+        engineNaive.update(); engineNaive.draw();
+        engineSafe.update(); engineSafe.draw();
+        requestAnimationFrame(animate);
+    }
+    animate();
+
+    document.getElementById('btn-race').addEventListener('click', () => {
+        const id = `ORD-${orderCounter++}`;
+        correctBalance -= 100; // 標準答案扣一次
+        
+        // 觸發高併發場景
+        engineNaive.triggerRace(id);
+        engineSafe.triggerRace(id);
+    });
+
+</script>
+</body>
+</html>
